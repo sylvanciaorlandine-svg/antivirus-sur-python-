@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Mini Antivirus Prototype with ClamAV + YARA integration (educational).
-- Uses 'clamscan' or 'clamdscan' (if available) for signature-based scanning.
-- Uses yara-python (import yara) for YARA rules scanning.
-- Provides a Tkinter UI to select files/folders, run scans, and quarantine.
-Important: This is an educational tool. Do NOT run on production systems without review.
+Mini Antivirus avec quarantaine contrôlée
+- Analyse fichiers/dossiers avec ClamAV, YARA et SHA256 locale
+- Vérifie l’existence du dossier quarantine avant d’y copier les fichiers infectés
+- Popup pour créer le dossier si absent
+- Interface Tkinter fonctionnelle
 """
 
 import os
-import shutil
-import time
-import threading
 import subprocess
 import json
+import hashlib
+import threading
+import time
+import shutil
 from tkinter import Tk, Button, Label, Text, END, filedialog, Scrollbar, RIGHT, Y, BOTH, LEFT, Frame, messagebox
 
-# Optional import for yara; if not installed, YARA scans will be skipped with a message.
+# Optionnel YARA
 try:
     import yara
     YARA_AVAILABLE = True
@@ -23,53 +24,35 @@ except Exception:
     YARA_AVAILABLE = False
 
 # Config
-QUARANTINE_DIR = os.path.join(os.getcwd(), "quarantine")
 LOGFILE = "scan_log.txt"
 SIGNATURE_DB = "signatures.json"
-YARA_RULES = "rules.yar"  # YARA rules file
+YARA_RULES = "rules.yar"
+QUARANTINE_DIR = "quarantine"
 
-def ensure_dirs():
-    os.makedirs(QUARANTINE_DIR, exist_ok=True)
-    if not os.path.exists(SIGNATURE_DB):
-        with open(SIGNATURE_DB, "w") as f:
-            json.dump({"sha256": []}, f)
+# Création de la base de signatures si elle n'existe pas
+if not os.path.exists(SIGNATURE_DB):
+    with open(SIGNATURE_DB, "w") as f:
+        json.dump({"sha256": []}, f)
 
 def save_log(line):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(LOGFILE, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {line}\n")
 
-def quarantine_file(path):
-    try:
-        base = os.path.basename(path)
-        target = os.path.join(QUARANTINE_DIR, f"{int(time.time())}_{base}")
-        shutil.move(path, target)
-        save_log(f"QUARANTINE: {path} -> {target}")
-        return True, target
-    except Exception as e:
-        save_log(f"QUARANTINE_FAILED: {path} ({e})")
-        return False, str(e)
-
 def call_clam_scan(path):
-    """
-    Call clamdscan (preferred) or clamscan. Returns (found:bool, output:str).
-    """
-    # Prefer clamdscan if available
+    """Scan avec ClamAV"""
     for cmd in (["clamdscan", "--fdpass", "--no-summary", path], ["clamscan", "--no-summary", path]):
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             out = proc.stdout + proc.stderr
-            # clamscan output lines containing 'OK' or 'FOUND'
-            # If 'FOUND' present -> infected
             if "FOUND" in out or "Infected files: 1" in out:
                 return True, out
-            else:
-                return False, out
+            return False, out
         except FileNotFoundError:
             continue
         except Exception as e:
             return False, f"ERROR calling clam scan: {e}"
-    return False, "ClamAV not found (install clamscan/clamdscan)."
+    return False, "ClamAV not found"
 
 def yara_scan_file(path, rules_path=YARA_RULES):
     if not YARA_AVAILABLE:
@@ -83,10 +66,17 @@ def yara_scan_file(path, rules_path=YARA_RULES):
     except Exception as e:
         return False, f"YARA error: {e}"
 
+def quarantine_file(path):
+    """Copie le fichier infecté dans le dossier quarantine"""
+    base = os.path.basename(path)
+    target = os.path.join(QUARANTINE_DIR, f"{int(time.time())}_{base}")
+    shutil.copy2(path, target)
+    return target
+
 class Scanner:
-    def __init__(self, ui_append):
+    def __init__(self, ui_append, check_quarantine_func):
         self.ui_append = ui_append
-        # load signature DB (sha256 list)
+        self.check_quarantine = check_quarantine_func
         try:
             with open(SIGNATURE_DB, "r") as f:
                 self.sign_db = json.load(f)
@@ -100,53 +90,49 @@ class Scanner:
             return
         self.ui_append(f"Scanning: {path}")
 
-        # 1) ClamAV scan
+        # ClamAV
         infected, clam_out = call_clam_scan(path)
         if infected:
-            self.ui_append(f"  INFECTED (ClamAV): {path}")
-            save_log(f"CLAMAV_INFECTED: {path}")
-            ok, info = quarantine_file(path)
-            if ok:
-                self.ui_append(f"  Quarantined: {info}")
-            else:
-                self.ui_append(f"  Quarantine failed: {info}")
+            if not self.check_quarantine():
+                self.ui_append(f"Scan arrêté : dossier quarantine manquant pour {path}")
+                return
+            target = quarantine_file(path)
+            self.ui_append(f"  INFECTED (ClamAV) -> {target}")
+            save_log(f"CLAMAV_INFECTED: {path} -> {target}")
             return
 
-        # 2) YARA scan
+        # YARA
         yara_found, yara_out = yara_scan_file(path)
         if yara_found:
-            self.ui_append(f"  YARA MATCH: {path} -> {yara_out}")
-            save_log(f"YARA_MATCH: {path} {yara_out}")
-            ok, info = quarantine_file(path)
-            if ok:
-                self.ui_append(f"  Quarantined: {info}")
-            else:
-                self.ui_append(f"  Quarantine failed: {info}")
+            if not self.check_quarantine():
+                self.ui_append(f"Scan arrêté : dossier quarantine manquant pour {path}")
+                return
+            target = quarantine_file(path)
+            self.ui_append(f"  INFECTED (YARA) -> {target}")
+            save_log(f"YARA_INFECTED: {path} -> {target} {yara_out}")
             return
-        elif yara_out and "not installed" in yara_out or "not found" in yara_out:
+        elif yara_out and ("not installed" in yara_out or "not found" in yara_out):
             self.ui_append(f"  YARA skipped: {yara_out}")
 
-        # 3) Signature DB (sha256) check (local DB)
+        # SHA256
         try:
-            import hashlib
             h = hashlib.sha256()
             with open(path, "rb") as f:
                 for chunk in iter(lambda: f.read(8192), b""):
                     h.update(chunk)
             sha = h.hexdigest()
             if sha in self.sign_db.get("sha256", []):
-                self.ui_append(f"  INFECTED (local signature): {path} sha256={sha}")
-                save_log(f"LOCAL_SIG_INFECTED: {path} {sha}")
-                ok, info = quarantine_file(path)
-                if ok:
-                    self.ui_append(f"  Quarantined: {info}")
-                else:
-                    self.ui_append(f"  Quarantine failed: {info}")
+                if not self.check_quarantine():
+                    self.ui_append(f"Scan arrêté : dossier quarantine manquant pour {path}")
+                    return
+                target = quarantine_file(path)
+                self.ui_append(f"  INFECTED (local signature) -> {target}")
+                save_log(f"LOCAL_SIG_INFECTED: {path} -> {target} {sha}")
                 return
         except Exception as e:
             self.ui_append(f"  Error computing sha256: {e}")
 
-        # Otherwise clean
+        # Sinon clean
         self.ui_append(f"  CLEAN: {path}")
         save_log(f"CLEAN: {path}")
 
@@ -168,10 +154,10 @@ class Scanner:
 class App:
     def __init__(self, master):
         self.master = master
-        master.title("Mini Antivirus (ClamAV + YARA) - Prototype")
+        master.title("Mini Antivirus - Quarantaine contrôlée")
 
         self.selected_path = None
-        self.scanner = Scanner(self.ui_append)
+        self.scanner = None
 
         top = Frame(master)
         top.pack(fill=BOTH, padx=8, pady=8)
@@ -186,7 +172,7 @@ class App:
         Button(btn_frame, text="Choisir dossier", command=self.choose_folder).pack(side=LEFT, padx=2)
         Button(btn_frame, text="Lancer le scan", command=self.start_scan).pack(side=LEFT, padx=2)
         Button(btn_frame, text="Arrêter le scan", command=self.stop_scan).pack(side=LEFT, padx=2)
-        Button(btn_frame, text="Ouvrir quarantaine", command=self.open_quarantine).pack(side=LEFT, padx=2)
+        Button(btn_frame, text="Ouvrir Quarantaine", command=self.open_quarantine).pack(side=LEFT, padx=2)
 
         log_frame = Frame(master)
         log_frame.pack(fill=BOTH, expand=True, padx=8, pady=4)
@@ -215,11 +201,24 @@ class App:
             self.lbl.config(text=f"Dossier: {p}")
             self.ui_append(f"Selected: {p}")
 
+    def check_quarantine(self):
+        if not os.path.exists(QUARANTINE_DIR):
+            ans = messagebox.askyesno("Quarantaine manquante",
+                                      f"Le dossier {QUARANTINE_DIR} n'existe pas.\nVoulez-vous le créer ?")
+            if ans:
+                os.makedirs(QUARANTINE_DIR)
+                self.ui_append(f"Dossier {QUARANTINE_DIR} créé.")
+                return True
+            else:
+                self.ui_append("Scan annulé : quarantaine requise.")
+                return False
+        return True
+
     def start_scan(self):
         if not self.selected_path:
             messagebox.showinfo("Sélectionnez", "Choisissez un fichier ou dossier d'abord.")
             return
-        self.scanner = Scanner(self.ui_append)  # reload db
+        self.scanner = Scanner(self.ui_append, self.check_quarantine)
         t = threading.Thread(target=self._scan_thread, args=(self.selected_path,), daemon=True)
         t.start()
         self.ui_append("Scan lancé...")
@@ -237,17 +236,24 @@ class App:
             self.ui_append("Demande d'arrêt envoyée.")
 
     def open_quarantine(self):
-        if os.name == "nt":
-            os.startfile(QUARANTINE_DIR)
-        else:
-            try:
-                import subprocess
-                subprocess.Popen(["xdg-open", QUARANTINE_DIR])
-            except Exception:
-                self.ui_append(f"Quarantine at: {QUARANTINE_DIR}")
+        if not os.path.exists(QUARANTINE_DIR):
+            ans = messagebox.askyesno("Quarantaine manquante",
+                                      f"Le dossier {QUARANTINE_DIR} n'existe pas.\nVoulez-vous le créer ?")
+            if ans:
+                os.makedirs(QUARANTINE_DIR)
+                self.ui_append(f"Dossier {QUARANTINE_DIR} créé.")
+            else:
+                return
+        # Ouvre le dossier quarantaine avec l'explorateur
+        try:
+            if os.name == 'nt':
+                os.startfile(os.path.abspath(QUARANTINE_DIR))
+            elif os.name == 'posix':
+                subprocess.run(['xdg-open', os.path.abspath(QUARANTINE_DIR)])
+        except Exception as e:
+            self.ui_append(f"Impossible d'ouvrir le dossier: {e}")
 
 if __name__ == "__main__":
-    ensure_dirs()
     try:
         root = Tk()
         app = App(root)
